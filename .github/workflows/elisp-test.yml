@@ -15,7 +15,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # Pin a release whose mu4e meets the package's floor: 26.04 ships
+        # 1.12.14, 24.04 only 1.10.8.
+        os: [ubuntu-26.04, macos-latest]
         emacs_version:
           - "snapshot"
           - "release-snapshot"

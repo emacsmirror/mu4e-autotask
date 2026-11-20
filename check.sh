@@ -209,7 +209,7 @@ fi
 # GitHub Actions / YAML
 
 echo -n "Checking GitHub workflows... $(echo .github/workflows/*.yml) "
-if actionlint .github/workflows/*.yml; then
+if actionlint -config-file .github/linters/actionlint.yml .github/workflows/*.yml; then
 	echo "OK!"
 else
 	echo "actionlint check failed!"

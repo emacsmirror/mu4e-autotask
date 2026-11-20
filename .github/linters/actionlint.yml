@@ -1,0 +1,6 @@
+---
+# actionlint, as of 1.7.12, does not know GitHub's ubuntu-26.04 runner label,
+# which the test matrix uses; declare it.  Drop this once actionlint does.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04
