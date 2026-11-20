@@ -35,11 +35,12 @@
 (require 'cl-lib)
 (require 'mm-decode)
 (require 'mu4e-autotask)
+(require 'mu4e-draft)
 
 ;;; Test helpers
 
 (defvar mu4e-autotask-test--buffers nil
-  "Buffers backing MIME handles created during a test, killed on cleanup.")
+  "Buffers created during a test, killed on cleanup.")
 
 (defmacro mu4e-autotask-test--with-cleanup (&rest body)
   "Run BODY, then kill the buffers recorded in `mu4e-autotask-test--buffers'."
@@ -261,7 +262,8 @@ new draft buffer current."
   "Non-nil once a `mu4e-autotask-test--choose-' RSVP prompt stand-in ran.")
 
 (defvar mu4e-autotask-test--sent nil
-  "Send result: t or the draft text once a send stand-in ran, nil before.")
+  "What the send stand-in that ran recorded, nil before one ran.
+Each `message-send-and-exit' stand-in's docstring says what it records.")
 
 (defvar mu4e-autotask-test--posted nil
   "Entry text captured by `mu4e-autotask-test--record-post', or nil.")
@@ -299,8 +301,8 @@ new draft buffer current."
   "Subj")
 
 (defun mu4e-autotask-test--unexpected-prompt (_prompt)
-  "Stand-in for a confirmation prompt that must never be reached."
-  (error "Unexpected second confirmation prompt"))
+  "Stand-in for a prompt that must never be reached."
+  (error "Unexpected prompt"))
 
 (defun mu4e-autotask-test--failing-success-fn ()
   "Send success function that signals an error."
@@ -314,14 +316,93 @@ new draft buffer current."
   "Stand-in for `message-send-and-exit': record the outgoing draft text."
   (setq mu4e-autotask-test--sent (buffer-string)))
 
-(defun mu4e-autotask-test--send-running-hooks ()
-  "Stand-in for `message-send-and-exit': record the send, run the sent hooks."
-  (setq mu4e-autotask-test--sent t)
-  (run-hooks 'message-sent-hook))
+(defun mu4e-autotask-test--send-recording-mml ()
+  "Stand-in for `message-send-and-exit': record the draft body's MML parse.
+mml parses only the body, as `message-encode-message-body' narrows to it."
+  (setq mu4e-autotask-test--sent
+        (save-excursion
+          (save-restriction
+            (message-goto-body)
+            (narrow-to-region (point) (point-max))
+            (mml-parse)))))
+
+(defconst mu4e-autotask-test--secure-method "pgpmime"
+  "The mml security method the test drafts are signed or encrypted with.
+The stand-ins pass it rather than leave the session's `mml-secure-method'
+in force, so that the assertions can expect it.")
+
+(defun mu4e-autotask-test--mml-child-p (item)
+  "Return non-nil if ITEM of an MML parse element is a child element.
+The element's other items are its attributes, conses of a symbol and a
+string or number."
+  (consp (cdr item)))
+
+(defun mu4e-autotask-test--mml-part-summary (part)
+  "Return the file name of the MML attachment PART, or else its contents."
+  (or (cdr (assq 'filename part)) (cdr (assq 'contents part))))
+
+(defun mu4e-autotask-test--secured-parts (parsed)
+  "Return the parts of the single element of the MML parse PARSED.
+Each is as `mu4e-autotask-test--mml-part-summary' gives it: the element's
+own contents when it is one part, or its child parts' when it is a
+multipart."
+  (let ((element (car parsed)))
+    (if (eq (car element) 'part)
+        (list (mu4e-autotask-test--mml-part-summary element))
+      (mapcar
+       #'mu4e-autotask-test--mml-part-summary
+       (seq-filter
+        #'mu4e-autotask-test--mml-child-p (cdr element))))))
+
+(defun mu4e-autotask-test--should-secure-all (parsed mode)
+  "Assert that the MML parse PARSED is a single element secured by MODE.
+MODE is `sign' or `encrypt'.  That element is what mml makes of mu4e's
+<#secure> tag when every part follows it."
+  (should (= (length parsed) 1))
+  (should
+   (equal
+    (cdr (assq mode (cdar parsed)))
+    mu4e-autotask-test--secure-method)))
+
+(defun mu4e-autotask-test--case-label (format-string &rest args)
+  "Return FORMAT-STRING formatted with ARGS, for an `ert-info' label.
+Line breaks and other control characters in ARGS that FORMAT-STRING formats
+with %S print escaped, so that a failure's label shows them as such."
+  (let ((print-escape-newlines t)
+        (print-escape-control-characters t))
+    (apply #'format format-string args)))
+
+(defvar mu4e-autotask-test--draft-secure nil
+  "The mml command securing the stand-ins' drafts, or nil to leave them be.
+It stands for the one mu4e's crypto policy calls.")
+
+(defun mu4e-autotask-test--finish-draft ()
+  "Finish composing the current draft as mu4e does.
+mu4e puts the <#secure> tag of its crypto policy, the one
+`mu4e-autotask-test--draft-secure' inserts here, at the top of the body,
+then enters `mu4e-compose-mode', whose hooks run with the tag in place."
+  (when mu4e-autotask-test--draft-secure
+    (funcall mu4e-autotask-test--draft-secure
+             mu4e-autotask-test--secure-method))
+  (run-hooks 'mu4e-compose-mode-hook))
+
+(defun mu4e-autotask-test--greeting-hook ()
+  "`mu4e-compose-mode-hook' member that greets atop the body, as a user's may."
+  (message-goto-body)
+  (insert "GREETING\n"))
 
 (defun mu4e-autotask-test--run-sent-hooks ()
-  "Stand-in for `message-send-and-exit': run the sent hooks, record nothing."
-  (run-hooks 'message-sent-hook))
+  "Stand-in for `message-send-and-exit': run the sent hooks, record nothing.
+Run the current buffer's `message-sent-hook' without the session's global
+members, which a local hook list runs through its t."
+  (cl-letf (((default-value 'message-sent-hook) nil))
+    (run-hooks 'message-sent-hook)))
+
+(defun mu4e-autotask-test--send-running-hooks ()
+  "Stand-in for `message-send-and-exit': record the send, run the sent hooks.
+Run them as `mu4e-autotask-test--run-sent-hooks' does."
+  (setq mu4e-autotask-test--sent t)
+  (mu4e-autotask-test--run-sent-hooks))
 
 (defun mu4e-autotask-test--record-post (&rest _)
   "Stand-in for `org-gcal-post-at-point': capture the entry buffer text."
@@ -515,22 +596,35 @@ Return the (HANDLE . PATH) conses in the order the attachments were visited."
        #'mu4e-autotask-test--record-save))
     (nreverse mu4e-autotask-test--saved)))
 
+(defmacro mu4e-autotask-test--with-confirmed-send (send-fn &rest body)
+  "Run BODY with the send confirmed and done by SEND-FN.
+SEND-FN stands in for `message-send-and-exit', and the confirmation reads the
+Subject as `mu4e-autotask-test--message-subject' gives it."
+  (declare (indent 1) (debug t))
+  `(cl-letf (((symbol-function 'message-field-value)
+              #'mu4e-autotask-test--message-subject)
+             ((symbol-function 'y-or-n-p)
+              #'mu4e-autotask-test--confirm-send)
+             ((symbol-function 'message-send-and-exit) ,send-fn))
+     ,@body))
+
+(defun mu4e-autotask-test--send-confirmed (send-fn success-fn)
+  "Confirm and send the current buffer via `mu4e-autotask-do-send-email'.
+SEND-FN stands in for `message-send-and-exit'; SUCCESS-FN is passed on."
+  (mu4e-autotask-test--with-confirmed-send send-fn
+    (mu4e-autotask-do-send-email "to@x" success-fn)))
+
 (defun mu4e-autotask-test--send-capturing-warning (success-fn)
-  "Confirm and send via `mu4e-autotask-do-send-email' with SUCCESS-FN, capturing.
+  "Send via `mu4e-autotask-do-send-email' with SUCCESS-FN, capturing a warning.
 The send confirmation is accepted and the sent hooks run SUCCESS-FN; return the
 single (TYPE MESSAGE LEVEL) list `display-warning' received."
   (let ((warnings nil))
-    (cl-letf (((symbol-function 'message-field-value)
-               #'mu4e-autotask-test--message-subject)
-              ((symbol-function 'y-or-n-p)
-               #'mu4e-autotask-test--confirm-send)
-              ((symbol-function 'message-send-and-exit)
-               #'mu4e-autotask-test--run-sent-hooks)
-              ((symbol-function 'display-warning)
+    (cl-letf (((symbol-function 'display-warning)
                (lambda (type message &optional level &rest _)
                  (push (list type message level) warnings))))
       (with-temp-buffer
-        (mu4e-autotask-do-send-email "to@x" success-fn)))
+        (mu4e-autotask-test--send-confirmed
+         #'mu4e-autotask-test--run-sent-hooks success-fn)))
     (should (equal (length warnings) 1))
     (car warnings)))
 
@@ -2360,29 +2454,26 @@ filename for them; FN must not be called for those."
             (push '(goto-body) events)
             nil))
          ((symbol-function 'mml-attach-file)
-          (lambda (f) (push `(attach ,f) events)))
-         ((symbol-function 'message-field-value)
-          #'mu4e-autotask-test--message-subject)
-         ((symbol-function 'y-or-n-p)
-          #'mu4e-autotask-test--confirm-send)
-         ((symbol-function 'message-send-and-exit)
+          (lambda (f) (push `(attach ,f) events))))
+      (mu4e-autotask-test--with-confirmed-send
           (lambda ()
             (push '(send) events)
-            (run-hooks 'message-sent-hook))))
-      (unwind-protect
-          (let ((ambient-buffer nil))
-            (with-temp-buffer
-              (setq ambient-buffer (current-buffer))
-              (mu4e-autotask-send-email
-               tmpl '("/tmp/file.pdf") success)
-              (should (buffer-live-p draft-buffer))
-              (with-current-buffer draft-buffer
-                (should (string-match-p "Body text" (buffer-string))))
-              (with-current-buffer ambient-buffer
-                (should-not
-                 (string-match-p "Body text" (buffer-string))))))
-        (when (buffer-live-p draft-buffer)
-          (kill-buffer draft-buffer))))
+            (mu4e-autotask-test--run-sent-hooks))
+        (unwind-protect
+            (let ((ambient-buffer nil))
+              (with-temp-buffer
+                (setq ambient-buffer (current-buffer))
+                (mu4e-autotask-send-email
+                 tmpl '("/tmp/file.pdf") success)
+                (should (buffer-live-p draft-buffer))
+                (with-current-buffer draft-buffer
+                  (should
+                   (string-match-p "Body text" (buffer-string))))
+                (with-current-buffer ambient-buffer
+                  (should-not
+                   (string-match-p "Body text" (buffer-string))))))
+          (when (buffer-live-p draft-buffer)
+            (kill-buffer draft-buffer)))))
     (should
      (equal
       (nreverse events)
@@ -2392,6 +2483,180 @@ filename for them; FN must not be called for those."
         (attach "/tmp/file.pdf")
         (send)
         success)))))
+
+(defvar mu4e-autotask-test--composed-context nil
+  "Name, `message-signature', Sent and Drafts folders of a new draft.")
+
+(defun mu4e-autotask-test--compose-new-in-context (to _subject)
+  "Stand-in for `mu4e-compose-new' that picks context and folders as mu4e does.
+Unless `mu4e-compose-context-policy' is `always-ask', which asks instead,
+mu4e switches a new message to a context that matches its nil parent, and
+takes its Sent and Drafts folders from the context matching that parent.
+Record the context's name and `message-signature' and the folders in
+`mu4e-autotask-test--composed-context', and leave current a draft to TO."
+  (mu4e--context-autoswitch nil mu4e-compose-context-policy)
+  (setq mu4e-autotask-test--composed-context
+        (list
+         (mu4e-context-name (mu4e-context-current))
+         message-signature
+         (mu4e-get-sent-folder)
+         (mu4e-get-drafts-folder)))
+  (push
+   (mu4e-autotask-test--make-draft to) mu4e-autotask-test--buffers))
+
+(defvar mu4e-autotask-test--send-contexts nil
+  "The `mu4e-contexts' a send stand-in saw, or nil before it ran.")
+
+(defun mu4e-autotask-test--send-recording-contexts ()
+  "Stand-in for `message-send-and-exit': record the contexts it sees.
+Record them in `mu4e-autotask-test--send-contexts'.  The send hook of newer
+mu4e, such as 1.14.4, switches to the draft's context, which needs them."
+  (setq mu4e-autotask-test--send-contexts mu4e-contexts))
+
+(ert-deftest mu4e-autotask-test-send-email-keeps-template-context ()
+  "A message is composed in the template's context, though another matches.
+Context B's match function accepts the nil parent of a new message, which
+mu4e switches to under any `mu4e-compose-context-policy' but `always-ask',
+which asks instead, and whose Sent and Drafts folders it takes.  The
+compose must neither switch nor ask, and take context A's folders.  The
+send still sees the contexts."
+  (dolist (policy '(ask always-ask))
+    (ert-info
+     ((mu4e-autotask-test--case-label "Policy %S" policy))
+     (mu4e-autotask-test--with-cleanup
+       (let ((mu4e-contexts
+              (list
+               (make-mu4e-context
+                :name "A"
+                :vars
+                '((message-signature . "SIG-A")
+                  (mu4e-sent-folder . "/a/sent")
+                  (mu4e-drafts-folder . "/a/drafts")))
+               (make-mu4e-context
+                :name "B"
+                :match-func #'always
+                :vars
+                '((message-signature . "SIG-B")
+                  (mu4e-sent-folder . "/b/sent")
+                  (mu4e-drafts-folder . "/b/drafts")))))
+             (mu4e-compose-context-policy policy)
+             (mu4e--context-current nil)
+             (message-signature nil)
+             (mu4e-sent-folder nil)
+             (mu4e-drafts-folder nil)
+             (mu4e-autotask-test--composed-context nil)
+             (mu4e-autotask-test--send-contexts nil))
+         (cl-letf (((symbol-function 'mu4e-compose-new)
+                    #'mu4e-autotask-test--compose-new-in-context)
+                   ((symbol-function 'mu4e--query-items-refresh)
+                    #'ignore)
+                   ((symbol-function 'mu4e--context-ask-user)
+                    #'mu4e-autotask-test--unexpected-prompt))
+           (mu4e-autotask-test--with-confirmed-send
+               #'mu4e-autotask-test--send-recording-contexts
+             (mu4e-autotask-send-email
+              (make-mu4e-autotask-email-template
+               :context "A"
+               :to "to@x"
+               :subject "Subj"
+               :body "Body text")
+              nil #'ignore)))
+         (should
+          (equal
+           mu4e-autotask-test--composed-context
+           '("A" "SIG-A" "/a/sent" "/a/drafts")))
+         (should
+          (eq mu4e-autotask-test--send-contexts mu4e-contexts)))))))
+
+(defun mu4e-autotask-test--compose-new-running-hooks (to subject)
+  "Stand-in for `mu4e-compose-new' that runs `mu4e-compose-mode-hook'.
+Leave current a new draft to TO with SUBJECT and a signature, finished as
+`mu4e-autotask-test--finish-draft' does."
+  (mu4e-autotask-test--make-draft to)
+  (message-replace-header "Subject" subject)
+  (goto-char (point-max))
+  (insert "\n-- \nSIG\n")
+  (push (current-buffer) mu4e-autotask-test--buffers)
+  (mu4e-autotask-test--finish-draft))
+
+(defun mu4e-autotask-test--send-template-mml (body attachments)
+  "Send a template with BODY and ATTACHMENTS; return the MML parse sent.
+The compose runs `mu4e-compose-mode-hook' and the draft is secured as
+`mu4e-autotask-test--draft-secure' says.  The attachments go at point, not at
+the end, whatever the session's `mml-attach-file-at-the-end'."
+  (let ((mu4e-autotask-test--sent nil)
+        (mml-attach-file-at-the-end nil))
+    (cl-letf (((symbol-function 'mu4e-context-switch) #'ignore)
+              ((symbol-function 'mu4e-compose-new)
+               #'mu4e-autotask-test--compose-new-running-hooks))
+      (mu4e-autotask-test--with-confirmed-send
+          #'mu4e-autotask-test--send-recording-mml
+        (mu4e-autotask-send-email
+         (make-mu4e-autotask-email-template
+          :context "ctx"
+          :to "to@x"
+          :subject "Subj"
+          :body body)
+         attachments #'ignore)))
+    mu4e-autotask-test--sent))
+
+(ert-deftest mu4e-autotask-test-send-email-secured-whole ()
+  "Under a crypto policy, the body and attachments follow <#secure>.
+mu4e puts the tag at the top of a new message's body, and mml signs or
+encrypts only what follows it.  The template's body goes below the tag and
+above the signature, ending its line, whether or not it ends in a line
+break, and the attachments follow it."
+  (pcase-dolist (`(,body ,secure ,mode ,attachments ,parts)
+                 '(("Body text"
+                    mml-secure-message-sign
+                    sign
+                    nil
+                    ("Body text\n\n-- \nSIG\n"))
+                   ("Body text\n"
+                    mml-secure-message-sign
+                    sign
+                    nil
+                    ("Body text\n\n-- \nSIG\n"))
+                   ("Body text"
+                    mml-secure-message-sign
+                    sign
+                    ("/tmp/file.pdf")
+                    ("Body text\n" "/tmp/file.pdf" "\n-- \nSIG\n"))
+                   ("Body text"
+                    mml-secure-message-encrypt
+                    encrypt
+                    ("/tmp/file.pdf")
+                    ("Body text\n" "/tmp/file.pdf" "\n-- \nSIG\n"))))
+    (ert-info
+     ((mu4e-autotask-test--case-label
+       "Body %S, secure %S, attachments %S"
+       body secure attachments))
+     (mu4e-autotask-test--with-cleanup
+       (let* ((mu4e-autotask-test--draft-secure secure)
+              (mu4e-compose-mode-hook nil)
+              (parsed
+               (mu4e-autotask-test--send-template-mml
+                body attachments)))
+         (mu4e-autotask-test--should-secure-all parsed mode)
+         (should
+          (equal
+           (mu4e-autotask-test--secured-parts parsed) parts)))))))
+
+(ert-deftest mu4e-autotask-test-send-email-body-first ()
+  "Without a <#secure> tag, the body goes first in the message body.
+It goes above the text a `mu4e-compose-mode-hook' member put there and the
+signature, and the attachments follow it."
+  (mu4e-autotask-test--with-cleanup
+    (let ((mu4e-autotask-test--draft-secure nil)
+          (mu4e-compose-mode-hook
+           '(mu4e-autotask-test--greeting-hook)))
+      (should
+       (equal
+        (mapcar
+         #'mu4e-autotask-test--mml-part-summary
+         (mu4e-autotask-test--send-template-mml
+          "Body text" '("/tmp/file.pdf")))
+        '("Body text\n" "/tmp/file.pdf" "GREETING\n\n-- \nSIG\n"))))))
 
 (ert-deftest mu4e-autotask-test-send-email-cancel ()
   "Declining the send discards the modified draft without a second prompt.
@@ -2425,18 +2690,13 @@ must suppress that and kill the buffer outright, then signal `user-error'."
   "`mu4e-autotask-do-send-email' confirms, wires SUCCESS-FN, and sends.
 This is the entry point for action functions that compose a message themselves
 and then want the same confirm-and-send behavior."
-  (let* ((events nil)
-         (success (lambda () (push 'success events))))
-    (cl-letf (((symbol-function 'message-field-value)
-               #'mu4e-autotask-test--message-subject)
-              ((symbol-function 'y-or-n-p)
-               #'mu4e-autotask-test--confirm-send)
-              ((symbol-function 'message-send-and-exit)
-               (lambda ()
-                 (push 'send events)
-                 (run-hooks 'message-sent-hook))))
-      (with-temp-buffer
-        (mu4e-autotask-do-send-email "to@x" success)))
+  (let ((events nil))
+    (with-temp-buffer
+      (mu4e-autotask-test--send-confirmed
+       (lambda ()
+         (push 'send events)
+         (mu4e-autotask-test--run-sent-hooks))
+       (lambda () (push 'success events))))
     (should (equal (nreverse events) '(send success)))))
 
 (ert-deftest mu4e-autotask-test-do-send-email-decline ()
@@ -2484,6 +2744,60 @@ sent message in a re-sendable compose buffer."
     (should (eq (nth 0 warning) 'mu4e-autotask))
     (should (string-match-p "Quit" (nth 1 warning)))
     (should (eq (nth 2 warning) :error))))
+
+(defun mu4e-autotask-test--fail-send ()
+  "Stand-in for `message-send-and-exit' whose send fails."
+  (error "Sending failed"))
+
+(ert-deftest mu4e-autotask-test-do-send-email-resend-runs-success-fn
+    ()
+  "A resend after a failed send still runs SUCCESS-FN, once.
+The failed send leaves the compose buffer live with its sent hook, which a
+resend from it runs."
+  (let ((calls 0))
+    (with-temp-buffer
+      (should
+       (equal
+        (should-error
+         (mu4e-autotask-test--send-confirmed
+          #'mu4e-autotask-test--fail-send
+          (lambda () (cl-incf calls))))
+        '(error "Sending failed")))
+      (should (zerop calls))
+      (mu4e-autotask-test--run-sent-hooks)
+      (should (= calls 1)))))
+
+(ert-deftest mu4e-autotask-test-do-send-email-success-fn-runs-once ()
+  "SUCCESS-FN runs once, however often the message is sent from the buffer.
+A sent compose buffer is only buried, keeping its sent hook, and a confirmed
+resend from it runs the hook again."
+  (let ((calls 0))
+    (with-temp-buffer
+      (mu4e-autotask-test--send-confirmed
+       #'mu4e-autotask-test--run-sent-hooks
+       (lambda () (cl-incf calls)))
+      (mu4e-autotask-test--run-sent-hooks)
+      (should (= calls 1)))))
+
+(ert-deftest
+    mu4e-autotask-test-do-send-email-failing-success-fn-runs-once
+    ()
+  "SUCCESS-FN that signals still runs only once.
+A resend must not repeat a follow-up that failed partway, such as an event
+saved but not posted."
+  (let ((calls 0)
+        (warnings 0))
+    (cl-letf (((symbol-function 'display-warning)
+               (lambda (&rest _) (cl-incf warnings))))
+      (with-temp-buffer
+        (mu4e-autotask-test--send-confirmed
+         #'mu4e-autotask-test--run-sent-hooks
+         (lambda ()
+           (cl-incf calls)
+           (mu4e-autotask-test--failing-success-fn)))
+        (mu4e-autotask-test--run-sent-hooks)))
+    (should (= calls 1))
+    (should (= warnings 1))))
 
 ;;; Meta tests
 

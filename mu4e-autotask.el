@@ -67,7 +67,6 @@
 (require 'mu4e-message)
 (require 'mu4e-context)
 (require 'mu4e-compose)
-(require 'mu4e-draft)
 ;; `mu4e-view' provides `mu4e-view-actions' and pulls in `mu4e-view-mime-parts'.
 ;; Depend on it rather than the internal `mu4e-mime-parts' file, which older mu4e
 ;; versions do not ship.
@@ -559,7 +558,9 @@ the confirmation prompt.  Call SUCCESS-FN only after the message is sent; on a
 declined send, discard the compose buffer and signal a `user-error'.  An error
 or quit SUCCESS-FN signals is downgraded to a warning: the message is already
 sent at that point, so the failure of a follow-up action must not present as a
-failed send.
+failed send.  SUCCESS-FN runs at most once.  It can run after this function
+has exited non-locally, when the message is resent from the compose buffer
+after a failed send, so it must not depend on the caller's dynamic extent.
 
 This is the building block behind `mu4e-autotask-send-email', exposed for action
 functions that compose a message themselves (e.g. a forward or reply) and then
@@ -568,25 +569,32 @@ want the same confirm-and-send behavior."
     (if (y-or-n-p
          (format "Send email to %s with subject %s? " to subject))
         (progn
-          ;; The buffer is destroyed right after the send attempt, so set the
-          ;; buffer-local hook value without bothering to clean it up.
-          (add-hook
-           'message-sent-hook
-           (lambda ()
-             ;; `message-sent-hook' runs after the send but before the
-             ;; send machinery's cleanup; an escaping error or quit would
-             ;; leave the sent message in a re-sendable compose buffer.
-             (condition-case err
-                 (funcall success-fn)
-               ((error quit)
-                (display-warning
-                 'mu4e-autotask
-                 (format
-                  "Message sent, but the follow-up action failed: %s"
-                  (error-message-string err))
-                 :error))))
-           nil
-           t)
+          ;; Leave the buffer-local hook in place: a failed send leaves the
+          ;; compose buffer live, and resending from it must still run
+          ;; SUCCESS-FN.  A sent one is only buried, unless
+          ;; `message-kill-buffer-on-exit' is set, and resending from it
+          ;; must not run SUCCESS-FN again.
+          (let ((ran nil))
+            (add-hook
+             'message-sent-hook
+             (lambda ()
+               (unless ran
+                 (setq ran t)
+                 ;; `message-sent-hook' runs after the send but before the
+                 ;; send machinery's cleanup; an escaping error or quit
+                 ;; would leave the sent message in a re-sendable compose
+                 ;; buffer.
+                 (condition-case err
+                     (funcall success-fn)
+                   ((error quit)
+                    (display-warning
+                     'mu4e-autotask
+                     (format
+                      "Message sent, but the follow-up action failed: %s"
+                      (error-message-string err))
+                     :error)))))
+             nil
+             t))
           (message-send-and-exit))
       ;; The body and attachments leave the compose buffer modified; declining
       ;; the send means discarding it, so kill unconditionally rather than
@@ -595,19 +603,43 @@ want the same confirm-and-send behavior."
         (message-kill-buffer))
       (user-error "Cancelled"))))
 
+(defun mu4e-autotask--goto-body-after-secure-tag ()
+  "Move point to the start of the message body, past a <#secure> tag there.
+mu4e puts the tag that its crypto policy asks for at the top of a composed
+message's body, and mml signs or encrypts only what follows the tag."
+  (message-goto-body)
+  (when (looking-at "<#secure[^\n]*>\n")
+    (goto-char (match-end 0))))
+
 ;;;###autoload
 (defun mu4e-autotask-send-email (template attachments success-fn)
   "Compose and send mail from TEMPLATE, call SUCCESS-FN once it is sent.
 TEMPLATE is a `mu4e-autotask-email-template'.  ATTACHMENTS is a list of file
-paths to attach.  SUCCESS-FN is called only after the message is sent."
+paths to attach.  The template's body goes first in the message body, after any
+<#secure> tag at its top, and ends its line; the attachments follow it.
+`mu4e-contexts' is nil while the message is composed, so a hook run then, such
+as `mu4e-compose-pre-hook' or `mu4e-compose-mode-hook', signals an error if it
+switches context; `mu4e-context-current' still returns the template's context in
+it.  The confirmation, a declined send and SUCCESS-FN, including when it can
+run, work as `mu4e-autotask-do-send-email' describes."
   (mu4e-context-switch
    'force (mu4e-autotask-email-template-context template))
-  (let ((mu4e-compose-context-policy nil)
-        (to (mu4e-autotask-email-template-to template)))
-    (mu4e-compose-new
-     to (mu4e-autotask-email-template-subject template))
-    (message-goto-body)
+  (let ((to (mu4e-autotask-email-template-to template)))
+    ;; mu4e would switch a new draft to a context that matches its nil
+    ;; parent, or that `mu4e-compose-context-policy' picks or asks for,
+    ;; and would take its draft and Fcc folders from a matching one.
+    ;; Hiding the contexts stops both, where binding
+    ;; `mu4e-compose-context-policy' to nil would stop only the policy's
+    ;; pick or prompt, not a matching context's switch nor its folders.
+    ;; The send gets them back: the send hook of newer mu4e, such as
+    ;; 1.14.4, switches to the draft's context.
+    (let ((mu4e-contexts nil))
+      (mu4e-compose-new
+       to (mu4e-autotask-email-template-subject template)))
+    (mu4e-autotask--goto-body-after-secure-tag)
     (insert (mu4e-autotask-email-template-body template))
+    (unless (bolp)
+      (insert "\n"))
     (dolist (attachment attachments)
       (mml-attach-file attachment))
     (mu4e-autotask-do-send-email to success-fn)))
