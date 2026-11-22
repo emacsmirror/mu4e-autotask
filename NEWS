@@ -2,6 +2,28 @@ mu4e-autotask NEWS -- history of user-visible changes
 
 * Changes in mu4e-autotask 1.1.0 (unreleased)
 
+** Incompatible Changes
+
+*** mu4e 1.12.5 or later is required
+    The stated requirement was mu4e 1.12, but RSVP replies use
+    `mu4e-compose-reply-to', added in 1.12.5.
+
+*** Compose hooks of `mu4e-autotask-send-email' see no `mu4e-contexts'
+    Hooks that run while the template's message is composed, such as
+    `mu4e-compose-pre-hook' and `mu4e-compose-mode-hook', see no
+    contexts, so one that switches context signals "No contexts
+    defined".  `mu4e-context-current' is the template's context there.
+
+*** Recording an event leaves the event file unsaved
+    Recording an event saved the event file, and was refused when a
+    buffer visiting it had unsaved changes.  org-gcal edits the entry
+    it posts without saving, so the next event recorded into the file
+    in the session was refused, after its RSVP had been sent.  The
+    entry is now appended to the file's buffer and left unsaved there,
+    as org-gcal leaves its own edits.  Recording is refused, after the
+    RSVP has been sent, while an org-capture into the file is open, as
+    aborting that capture can delete the entry.
+
 ** New Features
 
 *** New action helper `mu4e-autotask-browse-html-url-matching'
@@ -27,6 +49,46 @@ mu4e-autotask NEWS -- history of user-visible changes
     Accepting, declining or tentatively accepting a calendar
     invitation that has no SUMMARY used to fail on Emacs 31 with a
     wrong-type-argument error from the Gnus reply builder.
+
+*** RSVP replies with non-ASCII text are sent in UTF-8
+    The reply's calendar part named its UTF-8 charset inside the MIME
+    type, so the message encoder added a second charset parameter and
+    encoded the part in the charset it preferred, such as ISO-2022-JP
+    in a Japanese language environment.
+
+*** Send success functions run at most once
+    A sent compose buffer is only buried, keeping the hook that calls
+    the success function of `mu4e-autotask-send-email' and
+    `mu4e-autotask-do-send-email', so resending from it called that
+    function again: an RSVP warned that the event file had unsaved
+    changes, or recorded its event a second time.
+
+*** `mu4e-autotask-send-email' keeps the template's context
+    A mu4e context whose match function accepts the nil parent of a
+    new message, such as one that matches by host name or time of day,
+    took over the message composed from the template: its From
+    address, signature and folders replaced the template context's.
+
+*** Sent messages are signed or encrypted whole under a crypto policy
+    mu4e puts the <#secure> tag that `mu4e-compose-crypto-policy' asks
+    for at the top of a composed message's body, and mml signs or
+    encrypts only what follows the tag.  RSVP replies and
+    `mu4e-autotask-send-email' inserted their parts above it, so under
+    a signing policy they went out unsigned, and under an encrypting
+    one Message asked whether to send them unencrypted.  A message
+    from a template also showed the tag as text after its body, unless
+    an attachment came between them; then, as in an RSVP reply, the
+    tag became an extra signed or encrypted part that was empty or
+    held only the signature.  RSVP replies and
+    `mu4e-autotask-send-email' now insert their parts after the tag.
+
+*** Template bodies end their line
+    A template body that did not end in a line break ran into the text
+    after it: a compose hook's text at the top of the body, or the
+    signature separator when `message-signature-insert-empty-line' is
+    nil.  `mu4e-autotask-send-email' now ends the body's last line, so
+    by default such a body gets the empty line before the signature
+    that one ending in a line break already got.
 
 * Changes in mu4e-autotask 1.0.0 (2026-08-21)
 

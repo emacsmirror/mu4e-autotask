@@ -14,7 +14,7 @@ attachments, plus a small templated outgoing-mail engine.
 * Requirements
 
 - Emacs 29.1 or newer.
-- mu4e 1.12 or newer.  It ships with [[https://www.djcbsoftware.nl/code/mu/][mu]] and is not an ELPA package, so it is not a
+- mu4e 1.12.5 or newer.  It ships with [[https://www.djcbsoftware.nl/code/mu/][mu]] and is not an ELPA package, so it is not a
   declared package dependency; install mu separately.
 
 * Installation
@@ -92,7 +92,10 @@ the org-gcal file the event entry is appended to, and the Google calendar id
 creation for that message.  org-gcal is loaded only when this fires; it is not
 a declared package dependency.  Declined invitations never create events.  The
 event entry is titled after the invitation's =SUMMARY=, falling back to the
-message subject, or to =(no title)= if both are blank.
+message subject, or to =(no title)= if both are blank.  The entry is appended to
+the file's buffer and left unsaved there, as org-gcal leaves its own edits.
+Recording is refused, after the RSVP has been sent, while an org-capture into
+the file is open, as aborting that capture can delete the entry.
 
 #+begin_src emacs-lisp
 (setq mu4e-autotask-icalendar-event-target-function
@@ -267,7 +270,11 @@ Build a template and send it:
 
 =mu4e-autotask-send-email= switches to the template's mu4e context, composes the
 message, attaches the files, asks for confirmation, and calls the success
-function only after the message is sent.
+function only after the message is sent.  The template's body goes first in the
+message body, after any =<#secure>= tag that =mu4e-compose-crypto-policy= put at
+its top, and ends its line; the attachments follow it.  Hooks that run while it
+is composed, such as =mu4e-compose-pre-hook=, see =mu4e-contexts= as nil, so one
+that switches context signals an error.
 
 For action functions that compose a message themselves — a forward or a reply
 rather than a fresh template — use =mu4e-autotask-do-send-email=, the
@@ -284,3 +291,9 @@ no discards the draft and signals a =user-error=.
   (mu4e-autotask-do-send-email "accounting@example.com"
                                (lambda () (message "Forwarded"))))
 #+end_src
+
+The success function of either function runs at most once, and it can run
+after the call has exited non-locally: a failed send leaves the draft open,
+and sending it again from there calls the function then.  So the success
+function must not depend on the caller's dynamic extent, such as its dynamic
+variable bindings or cleanup; lexical variables it closes over stay valid.
