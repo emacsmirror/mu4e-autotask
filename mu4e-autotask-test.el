@@ -34,6 +34,7 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'mm-decode)
+(require 'org-capture)
 (require 'mu4e-autotask)
 (require 'mu4e-draft)
 
@@ -481,7 +482,8 @@ variable `user-full-name' non-empty, which the RSVP flow requires, and the
 org-gcal drawer and property names to their org-gcal defaults, as the package
 itself is absent from the test environment.  On exit kills the
 recorded draft buffer and any per-RSVP reply buffers, and deletes the files
-in `mu4e-autotask-test--files' along with any buffers visiting them."
+in `mu4e-autotask-test--files' along with any buffers visiting them, unsaved
+changes discarded."
   (declare (indent 0) (debug t))
   `(let
        ((mu4e-autotask-test--draft-to nil)
@@ -513,6 +515,10 @@ in `mu4e-autotask-test--files' along with any buffers visiting them."
            (kill-buffer buf)))
        (dolist (file mu4e-autotask-test--files)
          (when-let* ((buf (find-buffer-visiting file)))
+           ;; Recording leaves the buffer unsaved, which would make
+           ;; `kill-buffer' prompt.
+           (with-current-buffer buf
+             (set-buffer-modified-p nil))
            (kill-buffer buf))
          (delete-file file)))))
 
@@ -554,6 +560,53 @@ With REPLY-TO, include it as the message's Reply-To address."
     (with-temp-file file
       (insert body))
     (mu4e-autotask-test--invite-msg file)))
+
+(defun mu4e-autotask-test--whole-text (buffer)
+  "Return the text of BUFFER, whatever its narrowing."
+  (with-current-buffer buffer
+    (save-restriction
+      (widen)
+      (buffer-string))))
+
+(defun mu4e-autotask-test--should-leave-unsaved (org-file on-disk)
+  "Assert ORG-FILE's buffer has unsaved changes and the file holds ON-DISK."
+  (should
+   (with-current-buffer (find-buffer-visiting org-file)
+     (buffer-modified-p)))
+  (should
+   (equal
+    (with-temp-buffer
+      (insert-file-contents org-file)
+      (buffer-string))
+    on-disk)))
+
+(defun mu4e-autotask-test--accept-warnings (msg)
+  "Accept MSG through the RSVP flow; return the warnings it displayed.
+Each is a list (TYPE MESSAGE LEVEL), the latest first."
+  (let ((warnings nil))
+    (cl-letf (((symbol-function 'display-warning)
+               (lambda (type message &optional level &rest _)
+                 (push (list type message level) warnings))))
+      (mu4e-autotask-test--dispatch-rsvp
+       msg
+       #'mu4e-autotask-test--choose-accept
+       #'mu4e-autotask-test--send-running-hooks))
+    warnings))
+
+(defmacro mu4e-autotask-test--with-target-file (spec &rest body)
+  "Run BODY in `mu4e-autotask-test--with-rsvp' with an event target file.
+SPEC is (MSG-VAR FILE-VAR CONTENTS): bind MSG-VAR to the default REQUEST
+message and FILE-VAR to a temp org file holding CONTENTS, which the event
+target function maps every message to."
+  (declare (indent 1) (debug ((symbolp symbolp form) body)))
+  `(mu4e-autotask-test--with-rsvp
+     (let* ((,(nth 0 spec) (mu4e-autotask-test--request-msg))
+            (,(nth 1 spec) (mu4e-autotask-test--temp-file ".org"))
+            (mu4e-autotask-icalendar-event-target-function
+             (mu4e-autotask-test--target-for ,(nth 1 spec))))
+       (with-temp-file ,(nth 1 spec)
+         (insert ,(nth 2 spec)))
+       ,@body)))
 
 (defun mu4e-autotask-test--accept-records (msg &optional choice)
   "Accept MSG through the RSVP flow, recording the event into a temp org file.
@@ -1009,7 +1062,8 @@ invalid, so the flow must error rather than compose a broken reply."
 (ert-deftest
     mu4e-autotask-test-icalendar-accept-records-org-gcal-event
     ()
-  "Accepting with a target function records the event after the send."
+  "Accepting with a target function records the event after the send.
+The entry is appended to the target file's buffer."
   (mu4e-autotask-test--with-rsvp
     (let* ((msg (mu4e-autotask-test--request-msg))
            (org-file (mu4e-autotask-test--accept-records msg))
@@ -1020,9 +1074,9 @@ invalid, so the flow must error rather than compose a broken reply."
       (should
        (equal
         posted
-        (with-temp-buffer
-          (insert-file-contents org-file)
-          (buffer-string)))))))
+        (with-current-buffer (find-buffer-visiting org-file)
+          (buffer-string))))
+      (mu4e-autotask-test--should-leave-unsaved org-file ""))))
 
 (ert-deftest mu4e-autotask-test-icalendar-decline-sends-without-event
     ()
@@ -1484,77 +1538,112 @@ lowercase component name."
 (ert-deftest
     mu4e-autotask-test-icalendar-event-respects-narrowed-buffer
     ()
-  "Recording appends at true end-of-file despite a narrowed visiting buffer.
+  "Recording appends at the buffer's true end despite its narrowing.
 The pre-visited buffer's restriction and point are restored afterwards."
-  (mu4e-autotask-test--with-rsvp
-    (let* ((msg (mu4e-autotask-test--request-msg))
-           (org-file (mu4e-autotask-test--temp-file ".org"))
-           (mu4e-autotask-icalendar-event-target-function
-            (mu4e-autotask-test--target-for org-file)))
-      (with-temp-file org-file
-        (insert "* Existing\n** Nested\nBody\n"))
-      (let ((buf (find-file-noselect org-file)))
-        (with-current-buffer buf
-          ;; Narrow to the "** Nested\n" line, point inside it.
-          (narrow-to-region 12 22)
-          (goto-char 15))
-        (mu4e-autotask-test--dispatch-rsvp
-         msg
-         #'mu4e-autotask-test--choose-accept
-         #'mu4e-autotask-test--send-running-hooks)
-        (should
-         (string-prefix-p
-          "* Existing\n** Nested\nBody\n* Team meeting\n"
-          (with-temp-buffer
-            (insert-file-contents org-file)
-            (buffer-string))))
-        (with-current-buffer buf
-          (should (equal (point-min) 12))
-          (should (equal (point-max) 22))
-          (should (equal (point) 15)))))))
+  (mu4e-autotask-test--with-target-file
+      (msg org-file "* Existing\n** Nested\nBody\n")
+    (let ((buf (find-file-noselect org-file)))
+      (with-current-buffer buf
+        ;; Narrow to the "** Nested\n" line, point inside it.
+        (narrow-to-region 12 22)
+        (goto-char 15))
+      (mu4e-autotask-test--dispatch-rsvp
+       msg
+       #'mu4e-autotask-test--choose-accept
+       #'mu4e-autotask-test--send-running-hooks)
+      (should
+       (string-prefix-p
+        "* Existing\n** Nested\nBody\n* Team meeting\n"
+        (mu4e-autotask-test--whole-text buf)))
+      (mu4e-autotask-test--should-leave-unsaved
+       org-file "* Existing\n** Nested\nBody\n")
+      (with-current-buffer buf
+        (should (equal (point-min) 12))
+        (should (equal (point-max) 22))
+        (should (equal (point) 15))))))
 
-(ert-deftest mu4e-autotask-test-icalendar-event-unsaved-buffer-refused
+(ert-deftest
+    mu4e-autotask-test-icalendar-event-recorded-past-unsaved-buffer
     ()
-  "Recording refuses when the target file's buffer has unsaved edits.
-Accepting an invitation must not silently save the user's unrelated edits;
-the refusal surfaces as the follow-up warning and the file stays untouched."
-  (mu4e-autotask-test--with-rsvp
-    (let* ((msg (mu4e-autotask-test--request-msg))
-           (org-file (mu4e-autotask-test--temp-file ".org"))
-           (mu4e-autotask-icalendar-event-target-function
-            (mu4e-autotask-test--target-for org-file))
-           (warnings nil))
-      (with-temp-file org-file
-        (insert "* Existing\n"))
-      (with-current-buffer (find-file-noselect org-file)
-        (goto-char (point-max))
-        (insert "Unsaved note\n"))
-      (unwind-protect
-          (progn
-            (cl-letf (((symbol-function 'display-warning)
-                       (lambda (type message &optional level &rest _)
-                         (push (list type message level) warnings))))
-              (mu4e-autotask-test--dispatch-rsvp
-               msg
-               #'mu4e-autotask-test--choose-accept
-               #'mu4e-autotask-test--send-running-hooks))
-            (should (equal (length warnings) 1))
-            (should (eq (nth 0 (car warnings)) 'mu4e-autotask))
-            (should (string-match-p "unsaved" (nth 1 (car warnings))))
-            (should (eq (nth 2 (car warnings)) :error))
-            (should-not mu4e-autotask-test--posted)
-            (should
-             (buffer-modified-p (find-buffer-visiting org-file)))
-            (should
-             (equal
-              (with-temp-buffer
-                (insert-file-contents org-file)
-                (buffer-string))
-              "* Existing\n")))
-        ;; Clear the deliberate modification so cleanup's `kill-buffer'
-        ;; does not prompt.
-        (with-current-buffer (find-buffer-visiting org-file)
-          (set-buffer-modified-p nil))))))
+  "Recording appends to a target file's buffer with unsaved edits, unsaved.
+org-gcal edits the entry it posts without saving, so a recording that refused
+such a buffer refused the next one in the session, after its RSVP had been
+sent.  Saving would save the user's edits too."
+  (mu4e-autotask-test--with-target-file (msg org-file "* Existing\n")
+    (with-current-buffer (find-file-noselect org-file)
+      (goto-char (point-max))
+      (insert "Unsaved note\n"))
+    (should-not (mu4e-autotask-test--accept-warnings msg))
+    (should
+     (string-prefix-p
+      "* Existing\nUnsaved note\n* Team meeting\n"
+      mu4e-autotask-test--posted))
+    (mu4e-autotask-test--should-leave-unsaved
+     org-file "* Existing\n")))
+
+(defmacro mu4e-autotask-test--with-open-capture (file &rest body)
+  "Run BODY while an org-capture of an entry into FILE is open, then abort it."
+  (declare (indent 1) (debug t))
+  (let ((capture (make-symbol "capture")))
+    `(let ((org-capture-templates
+            (list
+             (list
+              "t" "Test" 'entry (list 'file ,file) "* Captured"))))
+       (org-capture nil "t")
+       (let ((,capture (current-buffer)))
+         (should (buffer-local-value 'org-capture-mode ,capture))
+         (unwind-protect
+             (progn
+               ,@body)
+           (with-current-buffer ,capture
+             (org-capture-kill)))))))
+
+(ert-deftest mu4e-autotask-test-icalendar-event-refused-during-capture
+    ()
+  "Recording refuses while an org-capture into the target file is open.
+Aborting that capture deletes the region it captures into, which would take
+in an entry appended at its end.  The refusal surfaces as the follow-up
+warning, with nothing appended or posted."
+  (mu4e-autotask-test--with-target-file (msg org-file "* Existing\n")
+    (mu4e-autotask-test--with-open-capture org-file
+      (let* ((base (find-buffer-visiting org-file))
+             (before (mu4e-autotask-test--whole-text base))
+             (warnings (mu4e-autotask-test--accept-warnings msg)))
+        (should (equal (length warnings) 1))
+        (should (eq (nth 0 (car warnings)) 'mu4e-autotask))
+        (should (string-match-p "org-capture" (nth 1 (car warnings))))
+        (should (eq (nth 2 (car warnings)) :error))
+        (should-not mu4e-autotask-test--posted)
+        (should
+         (equal (mu4e-autotask-test--whole-text base) before))))))
+
+(ert-deftest
+    mu4e-autotask-test-icalendar-event-recorded-during-other-capture
+    ()
+  "Recording proceeds while an org-capture into another file is open.
+The target file is visited, as it is whenever a capture into it is open."
+  (mu4e-autotask-test--with-target-file (msg org-file "")
+    (find-file-noselect org-file)
+    (mu4e-autotask-test--with-open-capture
+        (mu4e-autotask-test--temp-file ".org")
+      (should-not (mu4e-autotask-test--accept-warnings msg))
+      (should
+       (string-match-p
+        mu4e-autotask-test--recorded-event-re
+        mu4e-autotask-test--posted)))))
+
+(ert-deftest
+    mu4e-autotask-test-icalendar-event-recorded-past-indirect-buffer
+    ()
+  "Recording proceeds past an indirect buffer of the target file.
+Only one that an org-capture is open in refuses it."
+  (mu4e-autotask-test--with-target-file (msg org-file "* Existing\n")
+    (with-current-buffer (find-file-noselect org-file)
+      (clone-indirect-buffer nil nil))
+    (should-not (mu4e-autotask-test--accept-warnings msg))
+    (should
+     (string-prefix-p
+      "* Existing\n* Team meeting\n" mu4e-autotask-test--posted))))
 
 (ert-deftest mu4e-autotask-test-icalendar-no-organizer-uses-reply-to
     ()
@@ -1630,6 +1719,74 @@ failed or quit send) would mail the next invitation's reply instead."
                 (should
                  (string-match-p "UID:test-uid-1" (buffer-string)))))
           (kill-buffer draft-a))))))
+
+(defun mu4e-autotask-test--reply-to-finished (to)
+  "Stand-in for `mu4e-compose-reply-to' that finishes the draft as mu4e does.
+Create the draft to TO as `mu4e-autotask-test--reply-to' does, then finish
+it as `mu4e-autotask-test--finish-draft' does."
+  (mu4e-autotask-test--reply-to to)
+  (mu4e-autotask-test--finish-draft))
+
+(ert-deftest mu4e-autotask-test-icalendar-reply-signed-whole ()
+  "Under a signing crypto policy, the reply's parts follow the <#secure> tag.
+mu4e puts the tag at the top of the reply's body, and mml signs only what
+follows it, so the reply's alternative is the signed part's only child."
+  (mu4e-autotask-test--with-rsvp
+    (let ((mu4e-autotask-test--draft-secure #'mml-secure-message-sign)
+          (mu4e-compose-mode-hook nil))
+      (cl-letf (((symbol-function 'mu4e-compose-reply-to)
+                 #'mu4e-autotask-test--reply-to-finished))
+        (mu4e-autotask-test--dispatch-rsvp
+         (mu4e-autotask-test--request-msg)
+         #'mu4e-autotask-test--choose-accept
+         #'mu4e-autotask-test--send-recording-mml)))
+    (mu4e-autotask-test--should-secure-all
+     mu4e-autotask-test--sent 'sign)
+    (let ((children
+           (seq-filter
+            #'mu4e-autotask-test--mml-child-p
+            (cdar mu4e-autotask-test--sent))))
+      (should (equal (mapcar #'car children) '(multipart)))
+      (should
+       (equal (cdr (assq 'type (cdar children))) "alternative")))))
+
+(defun mu4e-autotask-test--send-recording-mime ()
+  "Stand-in for `message-send-and-exit': record the draft encoded as MIME."
+  (mml-to-mime)
+  (setq mu4e-autotask-test--sent (buffer-string)))
+
+(ert-deftest mu4e-autotask-test-icalendar-reply-attached-in-utf-8 ()
+  "The reply part is sent in UTF-8 with a single charset parameter.
+This holds even when mm prefers another charset for the reply's text."
+  (mu4e-autotask-test--with-rsvp
+    (let ((mm-coding-system-priorities '(iso-2022-jp utf-8)))
+      (mu4e-autotask-test--dispatch-rsvp
+       (mu4e-autotask-test--transformed-msg
+        "SUMMARY:Team meeting" "SUMMARY:会議")
+       #'mu4e-autotask-test--choose-accept
+       #'mu4e-autotask-test--send-recording-mime))
+    (let ((case-fold-search nil))
+      (should
+       (string-match-p
+        "^Content-Type: text/calendar; method=REPLY; charset=utf-8$"
+        mu4e-autotask-test--sent)))
+    (with-temp-buffer
+      (insert mu4e-autotask-test--sent)
+      (goto-char (point-min))
+      (search-forward (concat "\n" mail-header-separator "\n"))
+      (replace-match "\n\n")
+      (let ((handle (mm-dissect-buffer t t)))
+        (unwind-protect
+            (let ((calendar (nth 2 handle)))
+              (should
+               (equal
+                (mm-handle-media-type calendar) "text/calendar"))
+              (should
+               (string-search
+                "会議"
+                (decode-coding-string
+                 (mm-get-part calendar) 'utf-8))))
+          (mm-destroy-parts handle))))))
 
 (ert-deftest mu4e-autotask-test-icalendar-no-stray-mime-buffers ()
   "The RSVP flow destroys all MIME part buffers it dissected."
@@ -2784,7 +2941,7 @@ resend from it runs the hook again."
     ()
   "SUCCESS-FN that signals still runs only once.
 A resend must not repeat a follow-up that failed partway, such as an event
-saved but not posted."
+appended but not posted."
   (let ((calls 0)
         (warnings 0))
     (cl-letf (((symbol-function 'display-warning)

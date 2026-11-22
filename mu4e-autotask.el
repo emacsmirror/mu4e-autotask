@@ -118,10 +118,13 @@ meeting organizer, and confirm before sending."
 Called with the mu4e message plist; returns a cons (ORG-FILE . CALENDAR-ID):
 the org-gcal file the event entry is appended to and the Google calendar id
 \(the calendar's email-address form) it is posted to, or nil to skip event
-creation for that message.  When the variable itself is nil, the built-in
-invitation handler only sends the RSVP reply and never records events.
-Recording an event requires org-gcal, which is loaded on first use and is not
-a declared package dependency.  Declined invitations never create events.
+creation for that message.  The entry is appended to the file's buffer and left
+unsaved there, as org-gcal leaves its own edits.  Recording is refused while an
+org-capture into the file is open, as aborting that capture can delete the
+entry.  When the variable itself is nil, the built-in invitation handler only
+sends the RSVP reply and never records events.  Recording an event requires
+org-gcal, which is loaded on first use and is not a declared package dependency.
+Declined invitations never create events.
 
 For example:
 
@@ -814,12 +817,19 @@ compose buffer current and return the organizer address the reply goes to."
                            #'ignore))
                   (mu4e-compose-reply-to organizer))
               (mu4e-compose-reply-to organizer))
-            (message-goto-body)
+            (mu4e-autotask--goto-body-after-secure-tag)
             (mml-insert-multipart "alternative")
             (mml-insert-empty-tag 'part 'type "text/plain")
-            (mml-attach-buffer
-             (buffer-name reply-buffer)
-             "text/calendar; method=REPLY; charset=UTF-8")
+            ;; A charset inside the type string is not mml's charset: mml
+            ;; would encode the part in one it picks and append that too.
+            (mml-insert-empty-tag
+             'part
+             'type
+             "text/calendar; method=REPLY"
+             'charset
+             "utf-8"
+             'buffer
+             (buffer-name reply-buffer))
             ;; mml reads the attached buffer at send time, so the reply
             ;; buffer must live exactly as long as the draft; kill them
             ;; together.
@@ -887,20 +897,27 @@ dependency at fault."
   "Record a calendar event via org-gcal.
 TARGET is a cons (ORG-FILE . CALENDAR-ID); the entry titled TITLE, located at
 LOCATION, with the org timestamp TIME and body DESCRIPTION is appended to
-ORG-FILE and posted to the CALENDAR-ID Google calendar.  Signal a
-`user-error' when a buffer visits ORG-FILE with unsaved changes: recording
-saves the file, and the user's unrelated edits must not be saved as a side
-effect."
+ORG-FILE's buffer and posted to the CALENDAR-ID Google calendar.  The buffer
+is left unsaved, as org-gcal leaves its own edits to the entry: saving it
+would also save the user's unrelated edits there.  Signal a `user-error' while
+an org-capture into ORG-FILE is in progress: aborting it deletes the region it
+captures into, which would take in an entry appended at its end."
   ;; Load org-gcal before writing: its drawer and property name
   ;; customizations must be in effect for the entry text.
   (mu4e-autotask--icalendar-require-org-gcal)
-  (let ((visiting (find-buffer-visiting (car target))))
-    (when (and visiting (buffer-modified-p visiting))
-      (user-error "%s has unsaved changes; not recording the event"
-                  (car target))))
+  (when-let* ((visiting (find-buffer-visiting (car target)))
+              ((seq-some
+                (lambda (buffer)
+                  (and (eq (buffer-base-buffer buffer) visiting)
+                       (with-current-buffer buffer
+                         (bound-and-true-p org-capture-mode))))
+                (buffer-list))))
+    (user-error
+     "%s has an org-capture in progress; not recording the event"
+     (car target)))
   (with-current-buffer (find-file-noselect (car target))
     ;; The user may already visit this buffer narrowed and with point
-    ;; anywhere; append at the true end of file and restore their view.
+    ;; anywhere; append at the buffer's true end and restore their view.
     ;; The widen must cover `org-gcal-post-at-point', which reads the
     ;; entry at point.
     (save-excursion
@@ -935,7 +952,6 @@ effect."
             (unless (string-empty-p sanitized)
               (insert sanitized "\n"))))
         (insert ":END:\n")
-        (save-buffer)
         (org-gcal-post-at-point)))))
 
 (defun mu4e-autotask--icalendar-rsvp (msg)

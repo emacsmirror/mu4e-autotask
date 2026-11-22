@@ -8,4 +8,6 @@
                                                  (mu4e-autotask-test--with-mime-parts . 1)
                                                  (mu4e-autotask--with-mime-handle . 1)
                                                  (mu4e-autotask-test--with-confirmed-send . 1)
+                                                 (mu4e-autotask-test--with-open-capture . 1)
+                                                 (mu4e-autotask-test--with-target-file . 1)
                                                  (cl-defstruct . nil))))))
